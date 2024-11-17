@@ -1,92 +1,106 @@
-use sha2::{Sha256, Digest};
-use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
-use rand::rngs::OsRng;
-use thiserror::Error;
+from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from enhanced_identity_manager import EnhancedIdentityManager
+from pydantic import BaseModel
+from typing import List, Optional
+import asyncio
+import json
 
-#[derive(Error, Debug)]
-pub enum IdentityError {
-    #[error("signature verification failed")]
-    SignatureError,
-    #[error("invalid key format")]
-    KeyFormatError,
-    #[error("challenge generation failed")]
-    ChallengeError,
+app = FastAPI()
+security = HTTPBearer()
+identity_manager = EnhancedIdentityManager(
+    stacks_api_url="https://stacks-node-api.mainnet.stacks.co",
+    contract_address="ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM",
+    contract_name="digital-identity",
+    redis_url="redis://localhost:6379/0",
+    jwt_secret="your-secret-key"
+)
+
+class GameProfile(BaseModel):
+    username: str
+    game_specific_data: Optional[str]
+    recovery_address: Optional[str]
+
+class Achievement(BaseModel):
+    id: int
+    name: str
+    description: str
+
+ACHIEVEMENTS = {
+    1: Achievement(id=1, name="First Victory", description="Win your first game"),
+    2: Achievement(id=2, name="Social Butterfly", description="Play with 10 different players"),
+    3: Achievement(id=3, name="Veteran", description="Reach 100 games played")
 }
 
-pub struct IdentityVerifier {
-    keypair: Keypair,
-}
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+    try:
+        payload = await identity_manager.validate_session_token(credentials.credentials)
+        return payload["sub"]
+    except ValueError as e:
+        raise HTTPException(
+            status_code=401,
+            detail=str(e),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-impl IdentityVerifier {
-    pub fn new() -> Self {
-        let mut csprng = OsRng{};
-        let keypair: Keypair = Keypair::generate(&mut csprng);
-        Self { keypair }
-    }
+@app.post("/register")
+async def register_game_profile(profile: GameProfile):
+    """Register a new player with digital identity."""
+    result = await identity_manager.register_new_identity(
+        user_address=profile.username,
+        game_data=profile.game_specific_data,
+        recovery_address=profile.recovery_address
+    )
     
-    pub fn generate_challenge(&self, user_address: &str) -> Result<Vec<u8>, IdentityError> {
-        let mut hasher = Sha256::new();
-        hasher.update(user_address.as_bytes());
-        
-        // Add timestamp for uniqueness
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| IdentityError::ChallengeError)?
-            .as_secs()
-            .to_be_bytes();
-        
-        hasher.update(&timestamp);
-        Ok(hasher.finalize().to_vec())
-    }
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
     
-    pub fn sign_challenge(&self, challenge: &[u8]) -> Signature {
-        self.keypair.sign(challenge)
-    }
-    
-    pub fn verify_signature(
-        &self,
-        challenge: &[u8],
-        signature: &Signature,
-        public_key: &PublicKey
-    ) -> Result<bool, IdentityError> {
-        public_key
-            .verify(challenge, signature)
-            .map(|_| true)
-            .map_err(|_| IdentityError::SignatureError)
-    }
-    
-    pub fn get_public_key(&self) -> PublicKey {
-        self.keypair.public
-    }
-}
+    return result
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_challenge_generation() {
-        let verifier = IdentityVerifier::new();
-        let user_address = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM";
-        
-        let challenge = verifier.generate_challenge(user_address).unwrap();
-        assert_eq!(challenge.len(), 32); // SHA256 output length
+@app.get("/profile")
+async def get_profile(current_user: str = Depends(get_current_user)):
+    """Get the current player's profile and achievements."""
+    identity = await identity_manager.get_identity(current_user)
+    
+    if not identity:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    
+    achievements = [
+        ACHIEVEMENTS[ach_id] for ach_id in identity.achievements
+        if ach_id in ACHIEVEMENTS
+    ]
+    
+    return {
+        "address": identity.address,
+        "reputation": identity.reputation,
+        "trust_score": identity.trust_score,
+        "achievements": achievements,
+        "last_login": identity.last_login,
+        "validator_count": identity.validator_count
     }
 
-    #[test]
-    fn test_signature_verification() {
-        let verifier = IdentityVerifier::new();
-        let user_address = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM";
-        
-        let challenge = verifier.generate_challenge(user_address).unwrap();
-        let signature = verifier.sign_challenge(&challenge);
-        
-        let result = verifier.verify_signature(
-            &challenge,
-            &signature,
-            &verifier.get_public_key()
-        ).unwrap();
-        
-        assert!(result);
+@app.post("/achievements/{achievement_id}")
+async def award_achievement(
+    achievement_id: int,
+    current_user: str = Depends(get_current_user)
+):
+    """Award an achievement to the current player."""
+    if achievement_id not in ACHIEVEMENTS:
+        raise HTTPException(status_code=404, detail="Achievement not found")
+    
+    result = await identity_manager.add_achievement(
+        user_address=current_user,
+        achievement_id=achievement_id
+    )
+    
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    
+    return {
+        "message": f"Achievement '{ACHIEVEMENTS[achievement_id].name}' awarded",
+        "transaction_id": result["transaction_id"]
     }
-}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
